@@ -1,0 +1,124 @@
+# =============================================================================
+# Configuração do GitHub Environment: staging
+# =============================================================================
+#
+# ATENÇÃO: Este arquivo é documentação de referência.
+# O GitHub Environments é configurado diretamente na interface web do repositório:
+#   Settings → Environments → staging
+#
+# Para criar via GitHub CLI:
+#   gh api repos/{owner}/{repo}/environments/staging \
+#     --method PUT \
+#     --field wait_timer=0
+#
+# Para configurar via Terraform (github provider):
+#   resource "github_repository_environment" "staging" {
+#     environment = "staging"
+#     repository  = var.repo_name
+#   }
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# Identificação
+# ----------------------------------------------------------------------------
+name: staging
+description: >
+  Ambiente de homologação. Recebe deploys automáticos de qualquer branch
+  para validação de mudanças antes de chegar à produção.
+
+# ----------------------------------------------------------------------------
+# Regras de proteção do ambiente
+# ----------------------------------------------------------------------------
+protection_rules:
+  # Nenhum revisor necessário — staging deve ter deploys rápidos e automáticos
+  required_reviewers: 0
+
+  # Sem tempo de espera — deploys imediatos para agilizar feedback
+  wait_timer: 0          # minutos
+
+# ----------------------------------------------------------------------------
+# Política de branches permitidas para deploy neste ambiente
+# ----------------------------------------------------------------------------
+deployment_branch_policy:
+  # Qualquer branch pode fazer deploy em staging
+  type: all_branches
+  # Alternativa: protected_branches (apenas branches com branch protection)
+  # Alternativa: selected_branches (lista explícita de padrões)
+  protected_branches_only: false
+
+# ----------------------------------------------------------------------------
+# Secrets necessários (configurar em Settings → Environments → staging → Secrets)
+# Estes secrets sobrescrevem os secrets de nível de repositório para este env
+# ----------------------------------------------------------------------------
+secrets_needed:
+  - name: GCP_WORKLOAD_IDENTITY_PROVIDER
+    description: >
+      Provider URI do Workload Identity Federation do GCP para autenticação
+      sem senha via OIDC. Formato:
+      projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER
+
+  - name: GCP_SERVICE_ACCOUNT
+    description: >
+      E-mail da Service Account do GCP com permissões de CI/CD em staging.
+      Exemplo: cicd-staging@meu-projeto-staging.iam.gserviceaccount.com
+
+  - name: AZURE_CLIENT_ID
+    description: >
+      Client ID (Application ID) da Managed Identity ou App Registration
+      do Azure com acesso ao ambiente de staging.
+
+  - name: AZURE_TENANT_ID
+    description: >
+      ID do Azure Active Directory (tenant) onde a identidade está registrada.
+
+  - name: AZURE_SUBSCRIPTION_ID
+    description: >
+      ID da subscription Azure que contém os recursos de staging.
+
+# ----------------------------------------------------------------------------
+# Variables necessárias (configurar em Settings → Environments → staging → Variables)
+# Valores específicos do ambiente; não são secrets mas são injetados nos workflows
+# ----------------------------------------------------------------------------
+variables_needed:
+  - name: GCP_PROJECT_ID
+    description: "ID do projeto GCP de staging. Ex: meu-projeto-staging"
+    example: meu-projeto-staging
+
+  - name: AZURE_RESOURCE_GROUP
+    description: "Nome do Resource Group Azure de staging"
+    example: rg-devops-platform-staging
+
+  - name: GKE_CLUSTER_NAME
+    description: "Nome do cluster GKE de staging"
+    example: gke-platform-staging
+
+  - name: AKS_CLUSTER_NAME
+    description: "Nome do cluster AKS de staging"
+    example: aks-platform-staging
+
+  - name: GCP_REGION
+    description: "Região padrão do GCP para staging"
+    example: us-central1
+
+  - name: AZURE_LOCATION
+    description: "Localização padrão do Azure para staging"
+    example: eastus
+
+# ----------------------------------------------------------------------------
+# URLs e endpoints do ambiente (para referência)
+# ----------------------------------------------------------------------------
+endpoints:
+  app:          "https://staging.devops-platform.interno"
+  health_check: "https://staging.devops-platform.interno/health"
+  grafana:      "https://grafana.staging.devops-platform.interno"
+  kibana:       "https://kibana.staging.devops-platform.interno"
+
+# ----------------------------------------------------------------------------
+# Configurações de cleanup automático (opcional — via workflow agendado)
+# ----------------------------------------------------------------------------
+cleanup:
+  # Remover recursos idle após N horas sem atividade (economia de custo)
+  idle_timeout_hours: 12
+  # Horário de desligamento automático (UTC) — reduz custo fora do horário de trabalho
+  auto_shutdown_cron: "0 22 * * 1-5"   # Segunda a sexta, 22h UTC (19h BRT)
+  auto_startup_cron:  "0 12 * * 1-5"   # Segunda a sexta, 12h UTC (09h BRT)
