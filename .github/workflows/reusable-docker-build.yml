@@ -1,0 +1,280 @@
+name: Reutilizável — Build e Push Docker Multi-Plataforma
+
+# =============================================================================
+# Workflow reutilizável para build de imagens Docker com suporte a
+# multi-plataforma (linux/amd64, linux/arm64), cache via GitHub Actions Cache
+# e push para o Google Artifact Registry com autenticação OIDC sem senha.
+#
+# Como chamar este workflow:
+#
+#   jobs:
+#     build:
+#       uses: ./.github/workflows/reusable-docker-build.yml
+#       with:
+#         image_name: sample-app
+#         dockerfile_path: apps/sample-app/Dockerfile
+#         context_path: apps/sample-app
+#         registry: us-central1-docker.pkg.dev/meu-projeto/meu-repo
+#         push: true
+#         platforms: linux/amd64,linux/arm64
+#       secrets: inherit
+# =============================================================================
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Nome da imagem (sem registry/tag). Ex: sample-app"
+        type: string
+        required: true
+
+      dockerfile_path:
+        description: "Caminho para o Dockerfile relativo à raiz do repositório"
+        type: string
+        required: false
+        default: Dockerfile
+
+      context_path:
+        description: "Context de build do Docker (diretório relativo à raiz)"
+        type: string
+        required: false
+        default: "."
+
+      registry:
+        description: "URL base do registry. Ex: us-central1-docker.pkg.dev/projeto/repo"
+        type: string
+        required: true
+
+      push:
+        description: "Se true, faz push da imagem para o Artifact Registry"
+        type: boolean
+        required: false
+        default: false
+
+      platforms:
+        description: "Plataformas alvo separadas por vírgula. Ex: linux/amd64,linux/arm64"
+        type: string
+        required: false
+        default: linux/amd64
+
+      build_args:
+        description: "Build args adicionais no formato CHAVE=VALOR separados por newline"
+        type: string
+        required: false
+        default: ""
+
+      image_tag_suffix:
+        description: "Sufixo extra para a tag da imagem (opcional). Ex: -distroless"
+        type: string
+        required: false
+        default: ""
+
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER:
+        description: "Provider de Workload Identity Federation do GCP"
+        required: true
+      GCP_SERVICE_ACCOUNT:
+        description: "Service Account do GCP para push no Artifact Registry"
+        required: true
+
+    outputs:
+      image_digest:
+        description: "Digest SHA256 da imagem publicada. Ex: sha256:abc123..."
+        value: ${{ jobs.build.outputs.image_digest }}
+      image_tag:
+        description: "Tag completa da imagem publicada. Ex: us-central1-docker.pkg.dev/.../app:abc1234"
+        value: ${{ jobs.build.outputs.image_tag }}
+      image_ref:
+        description: "Referência completa com digest. Ex: registry/image@sha256:..."
+        value: ${{ jobs.build.outputs.image_ref }}
+
+permissions:
+  contents: read
+  id-token: write       # OIDC para autenticação sem senha no GCP
+  packages: write       # Necessário para push em registries do GitHub (opcional)
+
+jobs:
+  build:
+    name: "Build Docker — ${{ inputs.image_name }} (${{ inputs.platforms }})"
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_digest: ${{ steps.extract_meta.outputs.digest }}
+      image_tag:    ${{ steps.extract_meta.outputs.tag }}
+      image_ref:    ${{ steps.extract_meta.outputs.image_ref }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Checkout
+      # -----------------------------------------------------------------------
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Calcula tags e labels da imagem via Docker Metadata Action
+      # Gera automaticamente: tag com SHA curto, branch, semver se houver tag git
+      # -----------------------------------------------------------------------
+      - name: Gerar metadados da imagem (tags e labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ inputs.registry }}/${{ inputs.image_name }}${{ inputs.image_tag_suffix }}
+          tags: |
+            # Tag com o SHA curto do commit (sempre)
+            type=sha,prefix=,format=short
+            # Tag com o SHA completo (para rastreabilidade)
+            type=sha,prefix=sha-,format=long
+            # Tag da branch (ex: main, develop)
+            type=ref,event=branch
+            # Tag de PR (ex: pr-42)
+            type=ref,event=pr
+            # Tag semver se existir tag git (ex: v1.2.3 → 1.2.3, 1.2, 1)
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            # Tag "latest" apenas para push na branch main
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+          labels: |
+            org.opencontainers.image.title=${{ inputs.image_name }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+            br.com.devops-platform.cloud=gcp
+            br.com.devops-platform.environment=${{ github.ref_name }}
+
+      # -----------------------------------------------------------------------
+      # Configura QEMU para suporte a multi-plataforma (arm64)
+      # -----------------------------------------------------------------------
+      - name: Setup QEMU (emulação multi-plataforma)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ inputs.platforms }}
+
+      # -----------------------------------------------------------------------
+      # Configura Docker Buildx com suporte a cache e multi-platform
+      # -----------------------------------------------------------------------
+      - name: Setup Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      # -----------------------------------------------------------------------
+      # Autenticação no GCP via Workload Identity Federation (sem senha)
+      # Necessário apenas se push=true
+      # -----------------------------------------------------------------------
+      - name: Autenticar no GCP via OIDC
+        id: auth_gcp
+        if: inputs.push == true
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      # -----------------------------------------------------------------------
+      # Login no Artifact Registry usando o token OIDC
+      # -----------------------------------------------------------------------
+      - name: Login no Google Artifact Registry
+        if: inputs.push == true
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: oauth2accesstoken
+          password: ${{ steps.auth_gcp.outputs.access_token }}
+
+      # -----------------------------------------------------------------------
+      # Build e Push da imagem Docker
+      # - cache-from/cache-to: usa GitHub Actions Cache para acelerar builds
+      # - multi-platform: gera manifests para todas as plataformas listadas
+      # - provenance: assina o build com SLSA provenance (segurança da cadeia)
+      # - sbom: gera Software Bill of Materials embutido na imagem
+      # -----------------------------------------------------------------------
+      - name: Build ${{ inputs.push && 'e Push' || '(somente validação)' }} da imagem Docker
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.context_path }}
+          file: ${{ inputs.dockerfile_path }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Cache GHA para acelerar rebuilds — salva por branch
+          cache-from: type=gha,scope=${{ inputs.image_name }}-${{ github.ref_name }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image_name }}-${{ github.ref_name }}
+          # Provenance e SBOM apenas quando fazendo push
+          provenance: ${{ inputs.push }}
+          sbom: ${{ inputs.push }}
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            GIT_COMMIT=${{ github.sha }}
+            GIT_BRANCH=${{ github.ref_name }}
+            ${{ inputs.build_args }}
+
+      # -----------------------------------------------------------------------
+      # Extrai metadados da imagem para os outputs do workflow
+      # -----------------------------------------------------------------------
+      - name: Extrair digest e tag da imagem
+        id: extract_meta
+        run: |
+          DIGEST="${{ steps.build.outputs.digest }}"
+          # Pega a primeira tag gerada (SHA curto)
+          FIRST_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+          IMAGE_REF="${{ inputs.registry }}/${{ inputs.image_name }}${{ inputs.image_tag_suffix }}@${DIGEST}"
+
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+          echo "tag=${FIRST_TAG}" >> $GITHUB_OUTPUT
+          echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
+
+          echo "=== Metadados da imagem ==="
+          echo "Digest : ${DIGEST}"
+          echo "Tag    : ${FIRST_TAG}"
+          echo "Ref    : ${IMAGE_REF}"
+
+      # -----------------------------------------------------------------------
+      # Scan de vulnerabilidades com Trivy (sempre, independente do push)
+      # -----------------------------------------------------------------------
+      - name: Scan de vulnerabilidades — Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ inputs.push && steps.extract_meta.outputs.image_ref || format('{0}/{1}:sha-{2}', inputs.registry, inputs.image_name, github.sha) }}"
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"   # Não falha o build; apenas reporta
+        continue-on-error: true
+
+      - name: Upload scan Trivy → GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-${{ inputs.image_name }}
+
+      # -----------------------------------------------------------------------
+      # Resumo no GitHub Actions Summary
+      # -----------------------------------------------------------------------
+      - name: Publicar resumo do build no Actions Summary
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          PUSH_STATUS="${{ inputs.push && 'Sim' || 'Não (somente validação)' }}"
+
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## Build Docker — ${{ inputs.image_name }}
+
+          | Campo          | Valor |
+          |----------------|-------|
+          | Status         | ${STATUS} |
+          | Push realizado | ${PUSH_STATUS} |
+          | Plataformas    | \`${{ inputs.platforms }}\` |
+          | Digest         | \`${{ steps.extract_meta.outputs.digest }}\` |
+          | Tag            | \`${{ steps.extract_meta.outputs.tag }}\` |
+          | Commit         | \`${{ github.sha }}\` |
+          | Branch         | \`${{ github.ref_name }}\` |
+
+          EOF

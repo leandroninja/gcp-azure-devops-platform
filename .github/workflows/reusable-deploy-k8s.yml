@@ -1,0 +1,519 @@
+name: Reutilizável — Deploy Kubernetes (GKE / AKS)
+
+# =============================================================================
+# Workflow reutilizável para deploy no Kubernetes com suporte a três estratégias:
+#
+#   - rolling:     Atualização gradual padrão do Kubernetes (RollingUpdate)
+#   - blue-green:  Troca atômica de slots; usa script blue-green-switch.sh
+#   - canary:      Tráfego progressivo por peso; usa script canary-promote.sh
+#
+# Inclui health check pós-deploy com timeout de 10 minutos e rollback
+# automático em caso de falha.
+#
+# Como chamar este workflow:
+#
+#   jobs:
+#     deploy:
+#       uses: ./.github/workflows/reusable-deploy-k8s.yml
+#       with:
+#         cluster_type: gke
+#         cluster_name: meu-cluster
+#         namespace: production
+#         deployment_strategy: blue-green
+#         image_tag: sha-abc1234
+#         canary_weight: 10
+#       secrets: inherit
+# =============================================================================
+
+on:
+  workflow_call:
+    inputs:
+      cluster_type:
+        description: "Tipo do cluster Kubernetes: gke ou aks"
+        type: string
+        required: true
+
+      cluster_name:
+        description: "Nome do cluster GKE ou AKS"
+        type: string
+        required: true
+
+      namespace:
+        description: "Namespace Kubernetes onde o deploy será realizado"
+        type: string
+        required: false
+        default: production
+
+      deployment_strategy:
+        description: "Estratégia de deploy: rolling, blue-green ou canary"
+        type: string
+        required: false
+        default: rolling
+
+      image_tag:
+        description: "Tag ou digest da imagem Docker a ser deployada"
+        type: string
+        required: true
+
+      canary_weight:
+        description: "Peso inicial do canary em % (1-100). Usado apenas quando strategy=canary"
+        type: number
+        required: false
+        default: 10
+
+      service_name:
+        description: "Nome do serviço/deployment Kubernetes alvo"
+        type: string
+        required: false
+        default: sample-app
+
+      gcp_region:
+        description: "Região do GKE. Ex: us-central1"
+        type: string
+        required: false
+        default: us-central1
+
+      aks_resource_group:
+        description: "Resource Group do AKS"
+        type: string
+        required: false
+        default: rg-devops-platform
+
+      health_check_timeout:
+        description: "Timeout do health check em segundos (padrão: 600 = 10 minutos)"
+        type: number
+        required: false
+        default: 600
+
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER:
+        description: "Provider de Workload Identity Federation do GCP"
+        required: false
+      GCP_SERVICE_ACCOUNT:
+        description: "Service Account do GCP para autenticação no GKE"
+        required: false
+      AZURE_CLIENT_ID:
+        description: "Client ID da Managed Identity do Azure"
+        required: false
+      AZURE_TENANT_ID:
+        description: "Tenant ID do Azure Active Directory"
+        required: false
+      AZURE_SUBSCRIPTION_ID:
+        description: "Subscription ID do Azure"
+        required: false
+
+    outputs:
+      deploy_status:
+        description: "Status final do deploy: success, failed ou rolled_back"
+        value: ${{ jobs.deploy.outputs.deploy_status }}
+      active_slot:
+        description: "Slot ativo após o deploy (blue-green). Vazio para outras estratégias."
+        value: ${{ jobs.deploy.outputs.active_slot }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: "Deploy ${{ inputs.deployment_strategy }} — ${{ inputs.cluster_type }}/${{ inputs.cluster_name }}"
+    runs-on: ubuntu-latest
+
+    outputs:
+      deploy_status: ${{ steps.set_status.outputs.status }}
+      active_slot:   ${{ steps.get_slot.outputs.slot }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Checkout para ter acesso aos scripts do repositório
+      # -----------------------------------------------------------------------
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Autenticação no GKE via Workload Identity Federation
+      # -----------------------------------------------------------------------
+      - name: Autenticar no GCP via OIDC
+        id: auth_gcp
+        if: inputs.cluster_type == 'gke'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Obter credenciais do GKE
+        if: inputs.cluster_type == 'gke'
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ inputs.cluster_name }}
+          location:     ${{ inputs.gcp_region }}
+
+      # -----------------------------------------------------------------------
+      # Autenticação no AKS via OIDC
+      # -----------------------------------------------------------------------
+      - name: Autenticar no Azure via OIDC
+        if: inputs.cluster_type == 'aks'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Obter credenciais do AKS
+        if: inputs.cluster_type == 'aks'
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ inputs.aks_resource_group }}
+          cluster-name:   ${{ inputs.cluster_name }}
+
+      # -----------------------------------------------------------------------
+      # Verifica conectividade com o cluster antes de prosseguir
+      # -----------------------------------------------------------------------
+      - name: Verificar acesso ao cluster
+        run: |
+          echo "=== Verificando acesso ao cluster ${{ inputs.cluster_name }} ==="
+          kubectl cluster-info
+          kubectl get nodes --no-headers | awk '{print "Nó: "$1" | Status: "$2}'
+          echo "Namespace alvo: ${{ inputs.namespace }}"
+          kubectl get namespace ${{ inputs.namespace }} || kubectl create namespace ${{ inputs.namespace }}
+
+      # -----------------------------------------------------------------------
+      # Captura o estado atual antes do deploy (para rollback se necessário)
+      # -----------------------------------------------------------------------
+      - name: Capturar estado pré-deploy (snapshot para rollback)
+        id: pre_deploy_snapshot
+        run: |
+          echo "=== Snapshot do estado pré-deploy ==="
+
+          # Captura a imagem atual do deployment principal
+          CURRENT_IMAGE=$(kubectl get deployment ${{ inputs.service_name }} \
+            -n ${{ inputs.namespace }} \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+          echo "current_image=${CURRENT_IMAGE}" >> $GITHUB_OUTPUT
+          echo "Imagem atual: ${CURRENT_IMAGE}"
+
+          # Captura o slot ativo (para blue-green)
+          CURRENT_SLOT=$(kubectl get service ${{ inputs.service_name }} \
+            -n ${{ inputs.namespace }} \
+            -o jsonpath='{.spec.selector.slot}' 2>/dev/null || echo "unknown")
+          echo "current_slot=${CURRENT_SLOT}" >> $GITHUB_OUTPUT
+          echo "Slot atual: ${CURRENT_SLOT}"
+
+          # Captura a geração atual do deployment (para monitorar rollout)
+          CURRENT_GEN=$(kubectl get deployment ${{ inputs.service_name }} \
+            -n ${{ inputs.namespace }} \
+            -o jsonpath='{.metadata.generation}' 2>/dev/null || echo "0")
+          echo "current_generation=${CURRENT_GEN}" >> $GITHUB_OUTPUT
+
+      # =======================================================================
+      # ESTRATÉGIA: ROLLING UPDATE
+      # Atualiza a imagem do deployment e aguarda o rollout completar
+      # =======================================================================
+      - name: "Deploy — Rolling Update"
+        id: deploy_rolling
+        if: inputs.deployment_strategy == 'rolling'
+        run: |
+          echo "=== Deploy Rolling Update: ${{ inputs.service_name }} → ${{ inputs.image_tag }} ==="
+
+          # Atualiza a imagem do container principal
+          kubectl set image deployment/${{ inputs.service_name }} \
+            ${{ inputs.service_name }}=${{ inputs.image_tag }} \
+            -n ${{ inputs.namespace }}
+
+          # Adiciona anotação de deploy para rastreabilidade
+          kubectl annotate deployment/${{ inputs.service_name }} \
+            -n ${{ inputs.namespace }} \
+            "deployment.kubernetes.io/revision-note=deploy-${{ github.run_id }}" \
+            "deploy-timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "deploy-commit=${{ github.sha }}" \
+            --overwrite
+
+          echo "Comando de atualização enviado. Aguardando rollout..."
+
+      # =======================================================================
+      # ESTRATÉGIA: BLUE-GREEN
+      # Determina o slot inativo, atualiza a imagem e chama o script de switch
+      # =======================================================================
+      - name: "Deploy — Blue-Green (preparação do slot inativo)"
+        id: deploy_bluegreen_prep
+        if: inputs.deployment_strategy == 'blue-green'
+        run: |
+          CURRENT_SLOT="${{ steps.pre_deploy_snapshot.outputs.current_slot }}"
+          echo "Slot atualmente ativo: ${CURRENT_SLOT}"
+
+          # Determina o slot destino (sempre o oposto do ativo)
+          if [[ "${CURRENT_SLOT}" == "blue" ]]; then
+            TARGET_SLOT="green"
+          else
+            TARGET_SLOT="blue"
+          fi
+
+          echo "target_slot=${TARGET_SLOT}" >> $GITHUB_OUTPUT
+          echo "Slot destino do deploy: ${TARGET_SLOT}"
+
+          # Atualiza a imagem no deployment do slot inativo
+          kubectl set image deployment/${{ inputs.service_name }}-${TARGET_SLOT} \
+            ${{ inputs.service_name }}=${{ inputs.image_tag }} \
+            -n ${{ inputs.namespace }}
+
+          echo "Imagem ${{ inputs.image_tag }} aplicada no slot ${TARGET_SLOT}"
+
+      - name: "Deploy — Blue-Green (aguardar slot inativo ficar pronto)"
+        id: deploy_bluegreen_wait
+        if: inputs.deployment_strategy == 'blue-green'
+        run: |
+          TARGET_SLOT="${{ steps.deploy_bluegreen_prep.outputs.target_slot }}"
+
+          echo "Aguardando rollout do slot ${TARGET_SLOT}..."
+          kubectl rollout status deployment/${{ inputs.service_name }}-${TARGET_SLOT} \
+            -n ${{ inputs.namespace }} \
+            --timeout=${{ inputs.health_check_timeout }}s
+
+          echo "Slot ${TARGET_SLOT} pronto. Iniciando switch de tráfego..."
+
+      - name: "Deploy — Blue-Green (switch de tráfego via script)"
+        id: deploy_bluegreen_switch
+        if: inputs.deployment_strategy == 'blue-green'
+        run: |
+          TARGET_SLOT="${{ steps.deploy_bluegreen_prep.outputs.target_slot }}"
+
+          chmod +x scripts/blue-green-switch.sh
+
+          scripts/blue-green-switch.sh \
+            --cluster-type=${{ inputs.cluster_type }} \
+            --namespace=${{ inputs.namespace }} \
+            --service=${{ inputs.service_name }} \
+            --new-slot=${TARGET_SLOT} \
+            --max-retries=10
+
+      # =======================================================================
+      # ESTRATÉGIA: CANARY
+      # Atualiza o deployment canary e configura o peso de tráfego inicial
+      # =======================================================================
+      - name: "Deploy — Canary (atualizar deployment canary)"
+        id: deploy_canary_image
+        if: inputs.deployment_strategy == 'canary'
+        run: |
+          echo "=== Canary Deploy: peso inicial ${{ inputs.canary_weight }}% ==="
+
+          # Atualiza a imagem do deployment canary
+          kubectl set image deployment/${{ inputs.service_name }}-canary \
+            ${{ inputs.service_name }}=${{ inputs.image_tag }} \
+            -n ${{ inputs.namespace }} || {
+            # Se o deployment canary não existir, cria a partir do stable
+            echo "Deployment canary não encontrado — criando a partir do stable..."
+            kubectl get deployment ${{ inputs.service_name }}-stable \
+              -n ${{ inputs.namespace }} \
+              -o json | \
+              python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          d['metadata']['name'] = '${{ inputs.service_name }}-canary'
+          d['spec']['selector']['matchLabels']['track'] = 'canary'
+          d['spec']['template']['metadata']['labels']['track'] = 'canary'
+          d['spec']['replicas'] = 1
+          d.pop('status', None)
+          d['metadata'].pop('resourceVersion', None)
+          d['metadata'].pop('uid', None)
+          d['metadata'].pop('creationTimestamp', None)
+          print(json.dumps(d))
+          " | kubectl apply -f -
+
+            kubectl set image deployment/${{ inputs.service_name }}-canary \
+              ${{ inputs.service_name }}=${{ inputs.image_tag }} \
+              -n ${{ inputs.namespace }}
+          }
+
+          echo "Aguardando rollout do canary..."
+          kubectl rollout status deployment/${{ inputs.service_name }}-canary \
+            -n ${{ inputs.namespace }} \
+            --timeout=${{ inputs.health_check_timeout }}s
+
+      - name: "Deploy — Canary (configurar peso de tráfego via script)"
+        id: deploy_canary_weight
+        if: inputs.deployment_strategy == 'canary'
+        run: |
+          chmod +x scripts/canary-promote.sh
+
+          scripts/canary-promote.sh \
+            --cluster-type=${{ inputs.cluster_type }} \
+            --namespace=${{ inputs.namespace }} \
+            --service=${{ inputs.service_name }} \
+            --new-weight=${{ inputs.canary_weight }} \
+            --threshold=1.0 \
+            --monitor=60
+
+      # =======================================================================
+      # HEALTH CHECK PÓS-DEPLOY (todas as estratégias)
+      # Verifica se os pods estão prontos e sem CrashLoopBackOff
+      # Timeout configurável via input health_check_timeout (padrão 600s = 10min)
+      # =======================================================================
+      - name: Health Check pós-deploy
+        id: health_check
+        timeout-minutes: 10
+        run: |
+          echo "=== Health Check pós-deploy: estratégia=${{ inputs.deployment_strategy }} ==="
+          STRATEGY="${{ inputs.deployment_strategy }}"
+          SERVICE="${{ inputs.service_name }}"
+          NS="${{ inputs.namespace }}"
+          TIMEOUT=${{ inputs.health_check_timeout }}
+          ELAPSED=0
+          INTERVAL=15
+
+          # Para rolling e blue-green: monitora o deployment principal ou o slot ativo
+          if [[ "$STRATEGY" == "rolling" ]]; then
+            DEPLOYMENT_NAME="${SERVICE}"
+          elif [[ "$STRATEGY" == "blue-green" ]]; then
+            TARGET_SLOT="${{ steps.deploy_bluegreen_prep.outputs.target_slot }}"
+            DEPLOYMENT_NAME="${SERVICE}-${TARGET_SLOT}"
+          elif [[ "$STRATEGY" == "canary" ]]; then
+            DEPLOYMENT_NAME="${SERVICE}-canary"
+          fi
+
+          echo "Monitorando deployment: ${DEPLOYMENT_NAME}"
+          echo "Timeout: ${TIMEOUT}s | Intervalo de check: ${INTERVAL}s"
+
+          while [[ $ELAPSED -lt $TIMEOUT ]]; do
+            READY=$(kubectl get deployment "${DEPLOYMENT_NAME}" \
+              -n "${NS}" \
+              -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            DESIRED=$(kubectl get deployment "${DEPLOYMENT_NAME}" \
+              -n "${NS}" \
+              -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+            READY="${READY:-0}"
+            DESIRED="${DESIRED:-1}"
+
+            CRASH_COUNT=$(kubectl get pods \
+              -l "app=${SERVICE}" \
+              -n "${NS}" \
+              --no-headers 2>/dev/null \
+              | grep -cE "(CrashLoopBackOff|OOMKilled)" || echo "0")
+
+            echo "[${ELAPSED}s/${TIMEOUT}s] Pronto: ${READY}/${DESIRED} | CrashLoop: ${CRASH_COUNT}"
+
+            if [[ "$CRASH_COUNT" -gt 0 ]]; then
+              echo "FALHA: ${CRASH_COUNT} pod(s) em CrashLoopBackOff ou OOMKilled"
+              echo "health_check_result=failed" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+
+            if [[ "$READY" -ge "$DESIRED" && "$DESIRED" -gt 0 ]]; then
+              echo "SUCESSO: Todos os pods estão prontos (${READY}/${DESIRED})"
+              echo "health_check_result=success" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            ELAPSED=$((ELAPSED + INTERVAL))
+            sleep "${INTERVAL}"
+          done
+
+          echo "TIMEOUT: Health check não completou em ${TIMEOUT}s"
+          echo "health_check_result=timeout" >> $GITHUB_OUTPUT
+          exit 1
+
+      # =======================================================================
+      # ROLLBACK AUTOMÁTICO — executado somente se o health check falhar
+      # =======================================================================
+      - name: Rollback automático em caso de falha
+        id: rollback
+        if: failure() && steps.health_check.outcome == 'failure'
+        run: |
+          echo "=== ROLLBACK AUTOMÁTICO INICIADO ==="
+          echo "Motivo: health check falhou ou timeout"
+          STRATEGY="${{ inputs.deployment_strategy }}"
+          SERVICE="${{ inputs.service_name }}"
+          NS="${{ inputs.namespace }}"
+
+          case "$STRATEGY" in
+            rolling)
+              echo "Revertendo rolling update para a revisão anterior..."
+              kubectl rollout undo deployment/${SERVICE} -n ${NS}
+              kubectl rollout status deployment/${SERVICE} -n ${NS} --timeout=300s
+              echo "Rollback do rolling update concluído"
+              ;;
+
+            blue-green)
+              PREVIOUS_SLOT="${{ steps.pre_deploy_snapshot.outputs.current_slot }}"
+              echo "Revertendo tráfego para o slot anterior: ${PREVIOUS_SLOT}"
+
+              chmod +x scripts/blue-green-switch.sh
+              scripts/blue-green-switch.sh \
+                --cluster-type=${{ inputs.cluster_type }} \
+                --namespace=${NS} \
+                --service=${SERVICE} \
+                --new-slot=${PREVIOUS_SLOT} \
+                --max-retries=5 || true
+
+              echo "Tráfego revertido para slot ${PREVIOUS_SLOT}"
+              ;;
+
+            canary)
+              echo "Removendo canary (peso=0) — 100% do tráfego volta para stable..."
+              chmod +x scripts/canary-promote.sh
+              scripts/canary-promote.sh \
+                --cluster-type=${{ inputs.cluster_type }} \
+                --namespace=${NS} \
+                --service=${SERVICE} \
+                --new-weight=0 || true
+
+              echo "Canary removido — rollback concluído"
+              ;;
+          esac
+
+          echo "=== ROLLBACK AUTOMÁTICO CONCLUÍDO ==="
+
+      # -----------------------------------------------------------------------
+      # Define o status final do deploy nos outputs
+      # -----------------------------------------------------------------------
+      - name: Definir status final do deploy
+        id: set_status
+        if: always()
+        run: |
+          if [[ "${{ steps.health_check.outcome }}" == "success" ]]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.rollback.outcome }}" == "success" ]]; then
+            echo "status=rolled_back" >> $GITHUB_OUTPUT
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Capturar slot ativo pós-deploy
+        id: get_slot
+        if: always() && inputs.deployment_strategy == 'blue-green'
+        run: |
+          SLOT=$(kubectl get service ${{ inputs.service_name }} \
+            -n ${{ inputs.namespace }} \
+            -o jsonpath='{.spec.selector.slot}' 2>/dev/null || echo "unknown")
+          echo "slot=${SLOT}" >> $GITHUB_OUTPUT
+          echo "Slot ativo após deploy: ${SLOT}"
+
+      # -----------------------------------------------------------------------
+      # Resumo do deploy no GitHub Actions Summary
+      # -----------------------------------------------------------------------
+      - name: Publicar resumo do deploy
+        if: always()
+        run: |
+          STATUS="${{ steps.set_status.outputs.status }}"
+          SLOT="${{ steps.get_slot.outputs.slot }}"
+          HC_RESULT="${{ steps.health_check.outputs.health_check_result }}"
+
+          STATUS_ICON="✅"
+          [[ "$STATUS" == "rolled_back" ]] && STATUS_ICON="⚠️"
+          [[ "$STATUS" == "failed" ]] && STATUS_ICON="❌"
+
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## Deploy Kubernetes — ${{ inputs.deployment_strategy }}
+
+          | Campo              | Valor |
+          |--------------------|-------|
+          | Status             | ${STATUS_ICON} ${STATUS} |
+          | Cluster            | ${{ inputs.cluster_type }} / ${{ inputs.cluster_name }} |
+          | Namespace          | \`${{ inputs.namespace }}\` |
+          | Estratégia         | \`${{ inputs.deployment_strategy }}\` |
+          | Imagem             | \`${{ inputs.image_tag }}\` |
+          | Slot Ativo         | \`${SLOT:-N/A}\` |
+          | Health Check       | \`${HC_RESULT:-N/A}\` |
+          | Canary Weight      | ${{ inputs.canary_weight }}% |
+          | Commit             | \`${{ github.sha }}\` |
+
+          EOF

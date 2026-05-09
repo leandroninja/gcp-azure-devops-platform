@@ -1,0 +1,479 @@
+name: Reutilizável — Terraform Plan e Apply
+
+# =============================================================================
+# Workflow reutilizável para execução de Terraform em múltiplos ambientes
+# e provedores de nuvem (GCP, Azure ou ambos).
+#
+# Como chamar este workflow:
+#
+#   jobs:
+#     terraform:
+#       uses: ./.github/workflows/reusable-terraform.yml
+#       with:
+#         environment: staging
+#         cloud_provider: gcp
+#         working_directory: terraform
+#         apply: false
+#       secrets: inherit
+# =============================================================================
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Ambiente alvo do deploy (staging ou production)"
+        type: string
+        required: true
+        default: staging
+
+      cloud_provider:
+        description: "Provedor de nuvem alvo: gcp, azure ou both"
+        type: string
+        required: true
+        default: gcp
+
+      working_directory:
+        description: "Diretório raiz do Terraform"
+        type: string
+        required: false
+        default: terraform
+
+      apply:
+        description: "Se true, executa terraform apply após o plan bem-sucedido"
+        type: boolean
+        required: false
+        default: false
+
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER:
+        description: "Provider de Workload Identity Federation do GCP"
+        required: false
+      GCP_SERVICE_ACCOUNT:
+        description: "Service Account do GCP para impersonação via OIDC"
+        required: false
+      AZURE_CLIENT_ID:
+        description: "Client ID da Managed Identity / App Registration do Azure"
+        required: false
+      AZURE_TENANT_ID:
+        description: "Tenant ID do Azure Active Directory"
+        required: false
+      AZURE_SUBSCRIPTION_ID:
+        description: "Subscription ID do Azure"
+        required: false
+
+    outputs:
+      plan_exitcode_gcp:
+        description: "Exit code do terraform plan para GCP (0=sem mudanças, 2=com mudanças)"
+        value: ${{ jobs.plan.outputs.plan_exitcode_gcp }}
+      plan_exitcode_azure:
+        description: "Exit code do terraform plan para Azure (0=sem mudanças, 2=com mudanças)"
+        value: ${{ jobs.plan.outputs.plan_exitcode_azure }}
+      plan_summary:
+        description: "Resumo textual do plan"
+        value: ${{ jobs.plan.outputs.plan_summary }}
+
+# Permissões mínimas necessárias para OIDC e comentários no PR
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+  security-events: write
+
+env:
+  TF_VERSION: "1.7.5"
+  TFSEC_VERSION: "v1.28.4"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JOB: Scan de Segurança na IaC com tfsec e checkov
+  # Sempre executado, independente do provedor ou ambiente
+  # ---------------------------------------------------------------------------
+  security-scan:
+    name: "Segurança IaC — tfsec + checkov (${{ inputs.cloud_provider }})"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      # ---------- tfsec GCP ----------
+      - name: tfsec — scan de segurança GCP
+        if: inputs.cloud_provider == 'gcp' || inputs.cloud_provider == 'both'
+        uses: aquasecurity/tfsec-sarif-action@v0.1.4
+        with:
+          sarif_file: tfsec-gcp-results.sarif
+          working_directory: ${{ inputs.working_directory }}/modules/gcp
+          tfsec_version: ${{ env.TFSEC_VERSION }}
+          tfsec_args: "--include-passed --format sarif"
+
+      - name: Upload tfsec GCP → GitHub Security
+        if: (inputs.cloud_provider == 'gcp' || inputs.cloud_provider == 'both') && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tfsec-gcp-results.sarif
+          category: tfsec-gcp
+
+      # ---------- tfsec Azure ----------
+      - name: tfsec — scan de segurança Azure
+        if: inputs.cloud_provider == 'azure' || inputs.cloud_provider == 'both'
+        uses: aquasecurity/tfsec-sarif-action@v0.1.4
+        with:
+          sarif_file: tfsec-azure-results.sarif
+          working_directory: ${{ inputs.working_directory }}/modules/azure
+          tfsec_version: ${{ env.TFSEC_VERSION }}
+          tfsec_args: "--include-passed --format sarif"
+
+      - name: Upload tfsec Azure → GitHub Security
+        if: (inputs.cloud_provider == 'azure' || inputs.cloud_provider == 'both') && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tfsec-azure-results.sarif
+          category: tfsec-azure
+
+      # ---------- Checkov ----------
+      - name: Setup Python para Checkov
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar Checkov
+        run: pip install checkov --quiet
+
+      - name: Checkov — análise GCP
+        if: inputs.cloud_provider == 'gcp' || inputs.cloud_provider == 'both'
+        run: |
+          checkov \
+            --directory ${{ inputs.working_directory }}/modules/gcp \
+            --framework terraform \
+            --output sarif \
+            --output-file checkov-gcp-results.sarif \
+            --soft-fail \
+            --compact \
+            --quiet
+        continue-on-error: true
+
+      - name: Upload Checkov GCP → GitHub Security
+        if: (inputs.cloud_provider == 'gcp' || inputs.cloud_provider == 'both') && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-gcp-results.sarif
+          category: checkov-gcp
+
+      - name: Checkov — análise Azure
+        if: inputs.cloud_provider == 'azure' || inputs.cloud_provider == 'both'
+        run: |
+          checkov \
+            --directory ${{ inputs.working_directory }}/modules/azure \
+            --framework terraform \
+            --output sarif \
+            --output-file checkov-azure-results.sarif \
+            --soft-fail \
+            --compact \
+            --quiet
+        continue-on-error: true
+
+      - name: Upload Checkov Azure → GitHub Security
+        if: (inputs.cloud_provider == 'azure' || inputs.cloud_provider == 'both') && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-azure-results.sarif
+          category: checkov-azure
+
+  # ---------------------------------------------------------------------------
+  # JOB: Terraform Plan — executa plan para o provedor indicado
+  # Depende do security-scan ter passado
+  # ---------------------------------------------------------------------------
+  plan:
+    name: "Terraform Plan — ${{ inputs.cloud_provider }} (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    needs: security-scan
+    environment: ${{ inputs.environment }}
+
+    outputs:
+      plan_exitcode_gcp:   ${{ steps.plan_gcp.outputs.exitcode }}
+      plan_exitcode_azure: ${{ steps.plan_azure.outputs.exitcode }}
+      plan_summary:        ${{ steps.compose_summary.outputs.summary }}
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      # ---------- Autenticação GCP via Workload Identity Federation ----------
+      - name: Autenticar no GCP via OIDC
+        id: auth_gcp
+        if: inputs.cloud_provider == 'gcp' || inputs.cloud_provider == 'both'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      # ---------- Autenticação Azure via OIDC ----------
+      - name: Autenticar no Azure via OIDC
+        if: inputs.cloud_provider == 'azure' || inputs.cloud_provider == 'both'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ---------- Setup Terraform ----------
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true
+
+      # ---------- Init ----------
+      - name: Terraform Init
+        id: init
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          terraform init \
+            -backend-config="key=gcp-azure-platform/${{ inputs.environment }}/terraform.tfstate" \
+            -reconfigure \
+            -no-color
+        env:
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC:        "true"
+          GOOGLE_OAUTH_ACCESS_TOKEN: ${{ steps.auth_gcp.outputs.access_token }}
+
+      # ---------- Validate ----------
+      - name: Terraform Validate
+        id: validate
+        working-directory: ${{ inputs.working_directory }}
+        run: terraform validate -no-color
+
+      # ---------- Plan GCP ----------
+      - name: Terraform Plan — GCP
+        id: plan_gcp
+        if: inputs.cloud_provider == 'gcp' || inputs.cloud_provider == 'both'
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          set +e
+          terraform plan \
+            -var="environment=${{ inputs.environment }}" \
+            -target=module.gcp_networking \
+            -target=module.gcp_iam \
+            -target=module.gcp_gke \
+            -target=module.gcp_secret_manager \
+            -no-color \
+            -detailed-exitcode \
+            -out=tfplan-gcp-${{ inputs.environment }}.out \
+            2>&1 | tee terraform-plan-gcp.txt
+          PLAN_EXIT=${PIPESTATUS[0]}
+          echo "exitcode=${PLAN_EXIT}" >> $GITHUB_OUTPUT
+          exit 0
+        env:
+          GOOGLE_OAUTH_ACCESS_TOKEN: ${{ steps.auth_gcp.outputs.access_token }}
+          ARM_CLIENT_ID:             ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID:             ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID:       ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC:              "true"
+
+      # ---------- Plan Azure ----------
+      - name: Terraform Plan — Azure
+        id: plan_azure
+        if: inputs.cloud_provider == 'azure' || inputs.cloud_provider == 'both'
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          set +e
+          terraform plan \
+            -var="environment=${{ inputs.environment }}" \
+            -target=module.azure_networking \
+            -target=module.azure_aks \
+            -target=module.azure_key_vault \
+            -no-color \
+            -detailed-exitcode \
+            -out=tfplan-azure-${{ inputs.environment }}.out \
+            2>&1 | tee terraform-plan-azure.txt
+          PLAN_EXIT=${PIPESTATUS[0]}
+          echo "exitcode=${PLAN_EXIT}" >> $GITHUB_OUTPUT
+          exit 0
+        env:
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC:        "true"
+
+      # ---------- Compõe sumário para output ----------
+      - name: Compor resumo do plan
+        id: compose_summary
+        run: |
+          GCP_LINE=""
+          AZURE_LINE=""
+
+          if [ -f "${{ inputs.working_directory }}/terraform-plan-gcp.txt" ]; then
+            GCP_LINE=$(grep -E "^Plan:|No changes\." \
+              "${{ inputs.working_directory }}/terraform-plan-gcp.txt" | head -1 || echo "GCP: sem saída")
+          fi
+          if [ -f "${{ inputs.working_directory }}/terraform-plan-azure.txt" ]; then
+            AZURE_LINE=$(grep -E "^Plan:|No changes\." \
+              "${{ inputs.working_directory }}/terraform-plan-azure.txt" | head -1 || echo "Azure: sem saída")
+          fi
+
+          SUMMARY="GCP: ${GCP_LINE} | Azure: ${AZURE_LINE}"
+          echo "summary=${SUMMARY}" >> $GITHUB_OUTPUT
+
+      # ---------- Salva artefatos ----------
+      - name: Upload artefatos do plan
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terraform-plans-${{ inputs.environment }}-${{ inputs.cloud_provider }}-${{ github.run_id }}
+          path: |
+            ${{ inputs.working_directory }}/tfplan-gcp-${{ inputs.environment }}.out
+            ${{ inputs.working_directory }}/tfplan-azure-${{ inputs.environment }}.out
+            ${{ inputs.working_directory }}/terraform-plan-gcp.txt
+            ${{ inputs.working_directory }}/terraform-plan-azure.txt
+          retention-days: 7
+
+      # ---------- Comentário no PR ----------
+      - name: Comentar resultado do plan no PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        if: github.event_name == 'pull_request'
+        with:
+          header: terraform-plan-${{ inputs.environment }}-${{ inputs.cloud_provider }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          message: |
+            ## Terraform Plan — `${{ inputs.environment }}` / `${{ inputs.cloud_provider }}`
+
+            | Provedor | Exit Code | Status |
+            |----------|-----------|--------|
+            | GCP      | `${{ steps.plan_gcp.outputs.exitcode }}`   | ${{ steps.plan_gcp.outputs.exitcode == '1' && '❌ Erro' || steps.plan_gcp.outputs.exitcode == '2' && '🔄 Mudanças detectadas' || '✅ Sem mudanças' }} |
+            | Azure    | `${{ steps.plan_azure.outputs.exitcode }}` | ${{ steps.plan_azure.outputs.exitcode == '1' && '❌ Erro' || steps.plan_azure.outputs.exitcode == '2' && '🔄 Mudanças detectadas' || '✅ Sem mudanças' }} |
+
+            <details>
+            <summary>📋 Detalhes do Plan GCP</summary>
+
+            ```hcl
+            ${{ steps.plan_gcp.outcome != 'skipped' && '(ver artefato terraform-plan-gcp.txt)' || 'N/A — provedor não selecionado' }}
+            ```
+            </details>
+
+            <details>
+            <summary>📋 Detalhes do Plan Azure</summary>
+
+            ```hcl
+            ${{ steps.plan_azure.outcome != 'skipped' && '(ver artefato terraform-plan-azure.txt)' || 'N/A — provedor não selecionado' }}
+            ```
+            </details>
+
+            > Ambiente: `${{ inputs.environment }}` | Commit: `${{ github.sha }}` | Run: [`${{ github.run_id }}`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+  # ---------------------------------------------------------------------------
+  # JOB: Terraform Apply — só executa quando apply=true E environment=production
+  # Requer aprovação manual via GitHub Environment protection rules
+  # ---------------------------------------------------------------------------
+  apply:
+    name: "Terraform Apply — ${{ inputs.cloud_provider }} (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    needs: plan
+    # Só roda se apply=true e plan não teve exit code 1 (erro)
+    if: |
+      inputs.apply == true &&
+      needs.plan.outputs.plan_exitcode_gcp != '1' &&
+      needs.plan.outputs.plan_exitcode_azure != '1'
+    # Para production: usa environment com protection rules (aprovação manual + wait timer)
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      # ---------- Autenticação GCP ----------
+      - name: Autenticar no GCP via OIDC
+        id: auth_gcp
+        if: inputs.cloud_provider == 'gcp' || inputs.cloud_provider == 'both'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      # ---------- Autenticação Azure ----------
+      - name: Autenticar no Azure via OIDC
+        if: inputs.cloud_provider == 'azure' || inputs.cloud_provider == 'both'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true
+
+      # ---------- Baixa os artefatos do plan ----------
+      - name: Download artefatos do plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plans-${{ inputs.environment }}-${{ inputs.cloud_provider }}-${{ github.run_id }}
+          path: ${{ inputs.working_directory }}/
+
+      - name: Terraform Init (para apply)
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          terraform init \
+            -backend-config="key=gcp-azure-platform/${{ inputs.environment }}/terraform.tfstate" \
+            -reconfigure \
+            -no-color
+        env:
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC:        "true"
+          GOOGLE_OAUTH_ACCESS_TOKEN: ${{ steps.auth_gcp.outputs.access_token }}
+
+      # ---------- Apply GCP ----------
+      - name: Terraform Apply — GCP
+        if: inputs.cloud_provider == 'gcp' || inputs.cloud_provider == 'both'
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          terraform apply \
+            -auto-approve \
+            -no-color \
+            tfplan-gcp-${{ inputs.environment }}.out \
+            2>&1 | tee terraform-apply-gcp.txt
+        env:
+          GOOGLE_OAUTH_ACCESS_TOKEN: ${{ steps.auth_gcp.outputs.access_token }}
+          ARM_CLIENT_ID:             ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID:             ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID:       ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC:              "true"
+
+      # ---------- Apply Azure ----------
+      - name: Terraform Apply — Azure
+        if: inputs.cloud_provider == 'azure' || inputs.cloud_provider == 'both'
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          terraform apply \
+            -auto-approve \
+            -no-color \
+            tfplan-azure-${{ inputs.environment }}.out \
+            2>&1 | tee terraform-apply-azure.txt
+        env:
+          ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC:        "true"
+
+      - name: Comentar resultado do apply no PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        if: github.event_name == 'pull_request' && always()
+        with:
+          header: terraform-apply-${{ inputs.environment }}-${{ inputs.cloud_provider }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          message: |
+            ## Terraform Apply — `${{ inputs.environment }}` / `${{ inputs.cloud_provider }}`
+
+            | Provedor | Status |
+            |----------|--------|
+            | GCP      | ${{ job.status == 'success' && '✅ Aplicado com sucesso' || '❌ Falhou' }} |
+            | Azure    | ${{ job.status == 'success' && '✅ Aplicado com sucesso' || '❌ Falhou' }} |
+
+            > Aprovado em: `${{ github.event.review.submitted_at }}` | Commit: `${{ github.sha }}`

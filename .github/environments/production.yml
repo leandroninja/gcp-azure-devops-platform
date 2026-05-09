@@ -1,0 +1,165 @@
+# =============================================================================
+# Configuração do GitHub Environment: production
+# =============================================================================
+#
+# ATENÇÃO: Este arquivo é documentação de referência.
+# O GitHub Environments é configurado diretamente na interface web do repositório:
+#   Settings → Environments → production
+#
+# Para criar via GitHub CLI:
+#   gh api repos/{owner}/{repo}/environments/production \
+#     --method PUT \
+#     --field wait_timer=5 \
+#     --field reviewers='[{"type":"Team","id":TEAM_ID}]'
+#
+# Para configurar via Terraform (github provider):
+#   resource "github_repository_environment" "production" {
+#     environment = "production"
+#     repository  = var.repo_name
+#     wait_timer  = 5
+#     reviewers {
+#       teams = [var.ops_team_id]
+#     }
+#     deployment_branch_policy {
+#       protected_branches     = true
+#       custom_branch_policies = false
+#     }
+#   }
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# Identificação
+# ----------------------------------------------------------------------------
+name: production
+description: >
+  Ambiente de produção. Requer aprovação manual de pelo menos 1 revisor
+  e aguarda 5 minutos antes de iniciar qualquer deploy. Somente a branch
+  main pode fazer deploy em produção.
+
+# ----------------------------------------------------------------------------
+# Regras de proteção do ambiente
+# DIFERENÇA EM RELAÇÃO AO STAGING: reviewers=1 e wait_timer=5
+# ----------------------------------------------------------------------------
+protection_rules:
+  # Pelo menos 1 revisor aprovando antes do deploy ser iniciado
+  required_reviewers: 1
+
+  # Aguarda 5 minutos mesmo após aprovação — janela para cancelamento de emergência
+  wait_timer: 5          # minutos
+
+  # Quem pode aprovar deploys em produção:
+  # - Configurar em Settings → Environments → production → Required reviewers
+  # - Recomendado: time de ops ou senior engineers
+  reviewer_teams:
+    - ops-team
+    - senior-engineers
+  # reviewer_users: []   # Adicionar usuários específicos se necessário
+
+# ----------------------------------------------------------------------------
+# Política de branches — APENAS a branch main pode fazer deploy em produção
+# ----------------------------------------------------------------------------
+deployment_branch_policy:
+  type: main_only
+  # Somente a branch main (ou master) pode triggar deploys neste ambiente
+  protected_branches_only: true
+  # Branches adicionais permitidas (ex: hotfix/*) — deixar vazio para main apenas
+  allowed_branches: []
+
+# ----------------------------------------------------------------------------
+# Secrets necessários (configurar em Settings → Environments → production → Secrets)
+# IMPORTANTE: Usar Service Accounts com permissões MÍNIMAS para produção
+# ----------------------------------------------------------------------------
+secrets_needed:
+  - name: GCP_WORKLOAD_IDENTITY_PROVIDER
+    description: >
+      Provider URI do Workload Identity Federation do GCP para produção.
+      DEVE ser diferente do staging — use um pool e provider dedicados para prod.
+      Formato:
+      projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL-PROD/providers/PROVIDER-PROD
+
+  - name: GCP_SERVICE_ACCOUNT
+    description: >
+      E-mail da Service Account do GCP para produção, com permissões mínimas
+      necessárias apenas para CI/CD.
+      Exemplo: cicd-production@meu-projeto-prod.iam.gserviceaccount.com
+
+  - name: AZURE_CLIENT_ID
+    description: >
+      Client ID da Managed Identity do Azure para o ambiente de produção.
+      Usar identidade separada da de staging com permissões restritas.
+
+  - name: AZURE_TENANT_ID
+    description: >
+      ID do Azure Active Directory (tenant) de produção.
+
+  - name: AZURE_SUBSCRIPTION_ID
+    description: >
+      ID da subscription Azure de produção. Deve ser uma subscription separada
+      da de staging para isolamento de recursos e billing.
+
+# ----------------------------------------------------------------------------
+# Variables necessárias (Settings → Environments → production → Variables)
+# ----------------------------------------------------------------------------
+variables_needed:
+  - name: GCP_PROJECT_ID
+    description: "ID do projeto GCP de produção (separado do staging)"
+    example: meu-projeto-production
+
+  - name: AZURE_RESOURCE_GROUP
+    description: "Nome do Resource Group Azure de produção"
+    example: rg-devops-platform-production
+
+  - name: GKE_CLUSTER_NAME
+    description: "Nome do cluster GKE de produção"
+    example: gke-platform-production
+
+  - name: AKS_CLUSTER_NAME
+    description: "Nome do cluster AKS de produção"
+    example: aks-platform-production
+
+  - name: GCP_REGION
+    description: "Região padrão do GCP para produção"
+    example: us-central1
+
+  - name: AZURE_LOCATION
+    description: "Localização padrão do Azure para produção"
+    example: eastus
+
+# ----------------------------------------------------------------------------
+# URLs e endpoints do ambiente (para referência)
+# ----------------------------------------------------------------------------
+endpoints:
+  app:          "https://devops-platform.exemplo.com.br"
+  health_check: "https://devops-platform.exemplo.com.br/health"
+  grafana:      "https://grafana.devops-platform.exemplo.com.br"
+  kibana:       "https://kibana.devops-platform.exemplo.com.br"
+  status_page:  "https://status.devops-platform.exemplo.com.br"
+
+# ----------------------------------------------------------------------------
+# Políticas adicionais de segurança para produção
+# ----------------------------------------------------------------------------
+security_policies:
+  # Logs de auditoria de todos os deploys devem ser retidos por 90 dias
+  audit_log_retention_days: 90
+
+  # Notificações obrigatórias a cada deploy em produção
+  notifications:
+    - channel: "#deploys-producao"    # Slack
+    - email: ops@exemplo.com.br
+    - pagerduty: true                 # Alertas de falha via PagerDuty
+
+  # Janelas de deploy recomendadas (não bloqueantes, mas documentadas)
+  deploy_windows:
+    recommended: "Terça a quinta, 10h–16h BRT"
+    avoid: "Sextas após 14h BRT, vésperas de feriados, Black Friday"
+
+  # Rollback máximo sem aprovação: até 2 versões anteriores
+  max_auto_rollback_versions: 2
+
+# ----------------------------------------------------------------------------
+# Configurações de cleanup — NÃO há auto-shutdown em produção
+# ----------------------------------------------------------------------------
+cleanup:
+  idle_timeout_hours: null     # Produção nunca é desligada automaticamente
+  auto_shutdown_cron: null
+  auto_startup_cron:  null
