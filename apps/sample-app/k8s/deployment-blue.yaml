@@ -1,0 +1,159 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app-blue
+  namespace: production
+  labels:
+    app: sample-app
+    slot: blue
+    version: "1.0.0"
+    managed-by: github-actions
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+    deploy-strategy: blue-green
+spec:
+  # Número de réplicas gerenciado pelo HPA (não alterar aqui)
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sample-app
+      slot: blue
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0   # Zero downtime: nunca derruba pods antes de subir novos
+  template:
+    metadata:
+      labels:
+        app: sample-app
+        slot: blue
+        version: "1.0.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Não executa como root
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Tempo máximo para terminar graciosamente
+      terminationGracePeriodSeconds: 60
+
+      # Garante distribuição entre múltiplos nodes
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: sample-app
+              slot: blue
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: sample-app
+              slot: blue
+
+      # Anti-afinidade: distribui pods entre nodes diferentes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: sample-app
+                    slot: blue
+                topologyKey: kubernetes.io/hostname
+
+      containers:
+        - name: app
+          image: REGISTRY/sample-app:1.0.0   # Substituído pelo CI/CD
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            - name: APP_VERSION
+              value: "1.0.0"
+            - name: SLOT
+              value: "blue"
+            - name: ENVIRONMENT
+              value: "production"
+            - name: BUILD_DATE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['build-date']
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          # Liveness probe: reinicia o pod se não responder
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+
+          # Readiness probe: remove do LB se não estiver pronto
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+
+          # Startup probe: tempo extra no início (evita falsos positivos)
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12   # 12 * 5s = 60s máximo para iniciar
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1001
+            capabilities:
+              drop:
+                - ALL
+
+          # Volumes read-only para filesystem seguro
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+      # Apenas aceita pods em nodes com os labels corretos
+      nodeSelector:
+        nodepool-type: user
