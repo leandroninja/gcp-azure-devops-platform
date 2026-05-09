@@ -1,0 +1,143 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app-canary
+  namespace: production
+  labels:
+    app: sample-app
+    track: canary
+    managed-by: github-actions
+  annotations:
+    # Peso atual do canary (% de tráfego) — atualizado pelo CI/CD
+    canary-weight: "5"
+    # Imagem atual do canary
+    canary-image: "REGISTRY/sample-app:canary"
+    # Timestamp do início do canary
+    canary-started-at: ""
+    # Run ID do GitHub Actions que iniciou o canary
+    deploy-run-id: ""
+    deploy-strategy: canary
+spec:
+  # Réplicas proporcionais ao peso do canary.
+  # Para 5% de tráfego com stable em 3 réplicas: canary deve ter ~1 réplica
+  # O número é ajustado pelo script canary-promote.sh
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sample-app
+      track: canary
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: sample-app
+        track: canary
+        # Label 'version' atualizada pelo CI/CD com a tag da imagem
+        version: "canary"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+        # Metadados do canary para rastreamento
+        canary-weight: "5"
+        canary-version: "canary"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+
+      terminationGracePeriodSeconds: 60
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: sample-app
+              track: canary
+
+      containers:
+        - name: app
+          # Imagem substituída pelo CI/CD no momento do deploy
+          image: REGISTRY/sample-app:canary
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            - name: APP_VERSION
+              value: "canary"    # Substituído pelo CI/CD
+            - name: SLOT
+              value: "canary"
+            - name: ENVIRONMENT
+              value: "production"
+            - name: CANARY_WEIGHT
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['canary-weight']
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1001
+            capabilities:
+              drop:
+                - ALL
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+      nodeSelector:
+        nodepool-type: user

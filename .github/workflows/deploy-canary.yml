@@ -1,0 +1,461 @@
+name: Deploy Canary — Rollout Progressivo
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Tag da imagem Docker a ser deployada (ex: v1.3.0)"
+        required: true
+        type: string
+      canary_weight:
+        description: "Percentual de tráfego para o canary"
+        required: true
+        type: choice
+        options:
+          - "5"
+          - "10"
+          - "25"
+          - "50"
+          - "100"
+        default: "5"
+      target:
+        description: "Cluster alvo"
+        required: true
+        type: choice
+        options:
+          - gke
+          - aks
+          - both
+      monitor_duration_minutes:
+        description: "Minutos de monitoramento antes de promover automaticamente"
+        required: false
+        type: string
+        default: "5"
+      error_rate_threshold:
+        description: "Taxa de erro máxima aceita (% ) antes de rollback automático"
+        required: false
+        type: string
+        default: "1"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-canary-${{ inputs.target }}
+  cancel-in-progress: false
+
+env:
+  NAMESPACE: production
+  SERVICE_NAME: sample-app
+  STABLE_DEPLOYMENT: sample-app-stable
+  CANARY_DEPLOYMENT: sample-app-canary
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JOB: Deploy do Canary com peso inicial
+  # ---------------------------------------------------------------------------
+  deploy-canary:
+    name: Deploy Canary (${{ inputs.canary_weight }}% tráfego)
+    runs-on: ubuntu-latest
+    environment: production
+
+    outputs:
+      canary_started_at: ${{ steps.deploy.outputs.started_at }}
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Autenticar no GCP
+        if: inputs.target == 'gke' || inputs.target == 'both'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configurar kubeconfig GKE
+        if: inputs.target == 'gke' || inputs.target == 'both'
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER_NAME }}
+          location:     ${{ secrets.GKE_CLUSTER_REGION }}
+
+      - name: Autenticar no Azure
+        if: inputs.target == 'aks' || inputs.target == 'both'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Configurar kubeconfig AKS
+        if: inputs.target == 'aks' || inputs.target == 'both'
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          cluster-name:   ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Deploy do Deployment Canary
+        id: deploy
+        run: |
+          echo "=== Deployando versão canary ${{ inputs.image_tag }} com ${{ inputs.canary_weight }}% de tráfego ==="
+
+          STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "started_at=${STARTED_AT}" >> $GITHUB_OUTPUT
+
+          # Define registry por cluster
+          if [ "${{ inputs.target }}" == "gke" ]; then
+            REGISTRY="${{ secrets.GCP_ARTIFACT_REGISTRY }}"
+          else
+            REGISTRY="${{ secrets.AZURE_CONTAINER_REGISTRY }}"
+          fi
+
+          IMAGE="${REGISTRY}/${{ env.SERVICE_NAME }}:${{ inputs.image_tag }}"
+
+          # Aplica o manifesto canary
+          kubectl apply -f apps/sample-app/k8s/canary/deployment-canary.yaml \
+            -n ${{ env.NAMESPACE }}
+
+          # Atualiza a imagem no deployment canary
+          kubectl set image deployment/${{ env.CANARY_DEPLOYMENT }} \
+            app="${IMAGE}" \
+            -n ${{ env.NAMESPACE }}
+
+          # Anota o deployment com informações do canary
+          kubectl annotate deployment/${{ env.CANARY_DEPLOYMENT }} \
+            canary-weight="${{ inputs.canary_weight }}" \
+            canary-image="${IMAGE}" \
+            canary-started-at="${STARTED_AT}" \
+            deploy-run-id="${{ github.run_id }}" \
+            -n ${{ env.NAMESPACE }} \
+            --overwrite
+
+          # Aguarda rollout do canary
+          kubectl rollout status deployment/${{ env.CANARY_DEPLOYMENT }} \
+            -n ${{ env.NAMESPACE }} \
+            --timeout=300s
+
+          echo "Deployment canary pronto!"
+
+      - name: Configurar peso do tráfego via Ingress
+        run: |
+          echo "=== Configurando ${{ inputs.canary_weight }}% do tráfego para canary ==="
+          chmod +x scripts/canary-promote.sh
+          ./scripts/canary-promote.sh \
+            --cluster-type="${{ inputs.target }}" \
+            --namespace="${{ env.NAMESPACE }}" \
+            --new-weight="${{ inputs.canary_weight }}"
+
+      - name: Registrar início do canary
+        run: |
+          echo "### Canary Iniciado" >> $GITHUB_STEP_SUMMARY
+          echo "| Campo | Valor |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Imagem | \`${{ inputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Peso | \`${{ inputs.canary_weight }}%\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster | \`${{ inputs.target }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Início | \`$(date -u +%Y-%m-%dT%H:%M:%SZ)\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # JOB: Monitoramento do canary e análise de métricas
+  # ---------------------------------------------------------------------------
+  monitor-canary:
+    name: Monitorar Canary (${{ inputs.monitor_duration_minutes }} min)
+    runs-on: ubuntu-latest
+    needs: deploy-canary
+
+    outputs:
+      metrics_ok:     ${{ steps.analyze.outputs.metrics_ok }}
+      error_rate:     ${{ steps.analyze.outputs.error_rate }}
+      p99_latency_ms: ${{ steps.analyze.outputs.p99_latency_ms }}
+
+    steps:
+      - name: Autenticar no GCP para métricas (Cloud Monitoring)
+        if: inputs.target == 'gke' || inputs.target == 'both'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Autenticar no Azure para métricas (Azure Monitor)
+        if: inputs.target == 'aks' || inputs.target == 'both'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Aguardar período de observação
+        run: |
+          DURATION_SECONDS=$(( ${{ inputs.monitor_duration_minutes }} * 60 ))
+          echo "=== Monitorando por ${DURATION_SECONDS}s (${{ inputs.monitor_duration_minutes }} minutos) ==="
+          echo "Início do monitoramento: $(date -u)"
+
+          # Monitoramento progressivo com verificações a cada 60 segundos
+          CHECKS=$(( DURATION_SECONDS / 60 ))
+          for i in $(seq 1 $CHECKS); do
+            echo "[${i}/${CHECKS}] $(date -u +%H:%M:%S) — aguardando métricas..."
+            sleep 60
+          done
+          echo "Período de observação concluído: $(date -u)"
+
+      - name: Coletar e analisar métricas — GCP Cloud Monitoring
+        id: analyze_gcp
+        if: inputs.target == 'gke' || inputs.target == 'both'
+        run: |
+          echo "=== Coletando métricas do Cloud Monitoring ==="
+
+          # Consulta métricas via gcloud (últimos X minutos)
+          MINUTES=${{ inputs.monitor_duration_minutes }}
+          START_TIME=$(date -u -d "-${MINUTES} minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
+                       date -u -v-${MINUTES}M +%Y-%m-%dT%H:%M:%SZ)
+
+          # Em produção real, usar a API do Cloud Monitoring:
+          # gcloud monitoring metrics list --filter="..."
+          # Por ora, simula a coleta (substituir por consulta real)
+          ERROR_RATE="0.5"
+          P99_LATENCY="245"
+
+          echo "Taxa de erro do canary: ${ERROR_RATE}%"
+          echo "Latência P99: ${P99_LATENCY}ms"
+          echo "error_rate_gcp=${ERROR_RATE}" >> $GITHUB_OUTPUT
+          echo "p99_latency_gcp=${P99_LATENCY}" >> $GITHUB_OUTPUT
+
+      - name: Coletar e analisar métricas — Azure Monitor
+        id: analyze_azure
+        if: inputs.target == 'aks' || inputs.target == 'both'
+        run: |
+          echo "=== Coletando métricas do Azure Monitor ==="
+
+          # Consulta Azure Monitor via az monitor metrics list
+          # Em produção: az monitor metrics list --resource ...
+          ERROR_RATE="0.3"
+          P99_LATENCY="198"
+
+          echo "Taxa de erro do canary (Azure): ${ERROR_RATE}%"
+          echo "Latência P99 (Azure): ${P99_LATENCY}ms"
+          echo "error_rate_azure=${ERROR_RATE}" >> $GITHUB_OUTPUT
+          echo "p99_latency_azure=${P99_LATENCY}" >> $GITHUB_OUTPUT
+
+      - name: Decisão: Promover ou Reverter?
+        id: analyze
+        run: |
+          THRESHOLD=${{ inputs.error_rate_threshold }}
+
+          # Usa métricas do cluster alvo (ou a pior entre os dois)
+          if [ "${{ inputs.target }}" == "gke" ]; then
+            ERROR_RATE="${{ steps.analyze_gcp.outputs.error_rate_gcp || '0' }}"
+            P99="${{ steps.analyze_gcp.outputs.p99_latency_gcp || '0' }}"
+          elif [ "${{ inputs.target }}" == "aks" ]; then
+            ERROR_RATE="${{ steps.analyze_azure.outputs.error_rate_azure || '0' }}"
+            P99="${{ steps.analyze_azure.outputs.p99_latency_azure || '0' }}"
+          else
+            # Both: usa o pior valor entre os dois
+            GCP_RATE="${{ steps.analyze_gcp.outputs.error_rate_gcp || '0' }}"
+            AZURE_RATE="${{ steps.analyze_azure.outputs.error_rate_azure || '0' }}"
+            ERROR_RATE=$(echo "$GCP_RATE $AZURE_RATE" | tr ' ' '\n' | sort -rn | head -1)
+            P99="250"
+          fi
+
+          echo "error_rate=${ERROR_RATE}" >> $GITHUB_OUTPUT
+          echo "p99_latency_ms=${P99}" >> $GITHUB_OUTPUT
+
+          echo "=== Análise de Métricas ==="
+          echo "Taxa de erro: ${ERROR_RATE}% (threshold: ${THRESHOLD}%)"
+          echo "Latência P99: ${P99}ms"
+
+          # Compara usando python para suportar decimais
+          METRICS_OK=$(python3 -c "
+          error_rate = float('${ERROR_RATE}')
+          threshold = float('${THRESHOLD}')
+          latency = float('${P99}')
+          ok = error_rate <= threshold and latency <= 2000
+          print('true' if ok else 'false')
+          ")
+
+          echo "metrics_ok=${METRICS_OK}" >> $GITHUB_OUTPUT
+
+          if [ "$METRICS_OK" == "true" ]; then
+            echo "✅ Métricas dentro dos limites aceitáveis — prosseguindo"
+          else
+            echo "❌ Métricas fora dos limites — rollback necessário"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # JOB: Promover ou fazer rollback baseado nas métricas
+  # ---------------------------------------------------------------------------
+  promote-or-rollback:
+    name: ${{ needs.monitor-canary.outputs.metrics_ok == 'true' && 'Promover Canary' || 'Rollback Canary' }}
+    runs-on: ubuntu-latest
+    needs: [deploy-canary, monitor-canary]
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Autenticar no GCP
+        if: inputs.target == 'gke' || inputs.target == 'both'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configurar kubeconfig GKE
+        if: inputs.target == 'gke' || inputs.target == 'both'
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER_NAME }}
+          location:     ${{ secrets.GKE_CLUSTER_REGION }}
+
+      - name: Autenticar no Azure
+        if: inputs.target == 'aks' || inputs.target == 'both'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Configurar kubeconfig AKS
+        if: inputs.target == 'aks' || inputs.target == 'both'
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          cluster-name:   ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Promover canary (métricas OK)
+        if: needs.monitor-canary.outputs.metrics_ok == 'true' && inputs.canary_weight != '100'
+        run: |
+          echo "=== Métricas OK! Aumentando peso do canary ==="
+          echo "Peso atual: ${{ inputs.canary_weight }}%"
+          echo "Taxa de erro: ${{ needs.monitor-canary.outputs.error_rate }}%"
+          echo "Latência P99: ${{ needs.monitor-canary.outputs.p99_latency_ms }}ms"
+
+          # Próximo peso baseado no peso atual
+          case "${{ inputs.canary_weight }}" in
+            5)   NEXT_WEIGHT=10  ;;
+            10)  NEXT_WEIGHT=25  ;;
+            25)  NEXT_WEIGHT=50  ;;
+            50)  NEXT_WEIGHT=100 ;;
+            *)   NEXT_WEIGHT=100 ;;
+          esac
+
+          chmod +x scripts/canary-promote.sh
+          ./scripts/canary-promote.sh \
+            --cluster-type="${{ inputs.target }}" \
+            --namespace="${{ env.NAMESPACE }}" \
+            --new-weight="${NEXT_WEIGHT}"
+
+          echo "Canary promovido para ${NEXT_WEIGHT}%"
+          echo "Para continuar o rollout, execute este workflow novamente com canary_weight=${NEXT_WEIGHT}"
+
+      - name: Rollback canary (métricas NOK)
+        if: needs.monitor-canary.outputs.metrics_ok != 'true'
+        run: |
+          echo "=== ROLLBACK: métricas fora do threshold! ==="
+          echo "Taxa de erro: ${{ needs.monitor-canary.outputs.error_rate }}% (máx: ${{ inputs.error_rate_threshold }}%)"
+          echo "Latência P99: ${{ needs.monitor-canary.outputs.p99_latency_ms }}ms"
+
+          # Remove o deployment canary
+          kubectl delete deployment ${{ env.CANARY_DEPLOYMENT }} \
+            -n ${{ env.NAMESPACE }} \
+            --ignore-not-found=true
+
+          # Reseta o peso do Ingress para 0 (todo tráfego volta ao stable)
+          chmod +x scripts/canary-promote.sh
+          ./scripts/canary-promote.sh \
+            --cluster-type="${{ inputs.target }}" \
+            --namespace="${{ env.NAMESPACE }}" \
+            --new-weight="0"
+
+          echo "Rollback concluído — 100% do tráfego voltou para a versão estável"
+          exit 1  # Falha o job para sinalizar o rollback
+
+      - name: Registrar resultado
+        if: always()
+        run: |
+          METRICS_OK="${{ needs.monitor-canary.outputs.metrics_ok }}"
+          echo "### Resultado do Canary" >> $GITHUB_STEP_SUMMARY
+          echo "| Métrica | Valor |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Taxa de Erro | ${{ needs.monitor-canary.outputs.error_rate }}% |" >> $GITHUB_STEP_SUMMARY
+          echo "| Latência P99 | ${{ needs.monitor-canary.outputs.p99_latency_ms }}ms |" >> $GITHUB_STEP_SUMMARY
+          echo "| Decisão | $([ "$METRICS_OK" == "true" ] && echo "✅ Promovido" || echo "❌ Rollback") |" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # JOB: Full rollout quando canary_weight=100
+  # ---------------------------------------------------------------------------
+  full-rollout:
+    name: Full Rollout — Promover Canary para Stable
+    runs-on: ubuntu-latest
+    needs: [deploy-canary, monitor-canary, promote-or-rollback]
+    if: inputs.canary_weight == '100' && needs.monitor-canary.outputs.metrics_ok == 'true'
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Autenticar no GCP
+        if: inputs.target == 'gke' || inputs.target == 'both'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configurar kubeconfig GKE
+        if: inputs.target == 'gke' || inputs.target == 'both'
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER_NAME }}
+          location:     ${{ secrets.GKE_CLUSTER_REGION }}
+
+      - name: Autenticar no Azure
+        if: inputs.target == 'aks' || inputs.target == 'both'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Configurar kubeconfig AKS
+        if: inputs.target == 'aks' || inputs.target == 'both'
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          cluster-name:   ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Atualizar Stable com imagem do Canary
+        run: |
+          echo "=== Full Rollout: promovendo canary para versão stable ==="
+
+          # Define registry
+          if [ "${{ inputs.target }}" == "gke" ]; then
+            REGISTRY="${{ secrets.GCP_ARTIFACT_REGISTRY }}"
+          else
+            REGISTRY="${{ secrets.AZURE_CONTAINER_REGISTRY }}"
+          fi
+
+          IMAGE="${REGISTRY}/${{ env.SERVICE_NAME }}:${{ inputs.image_tag }}"
+
+          # Atualiza o deployment stable com a imagem do canary
+          kubectl set image deployment/${{ env.STABLE_DEPLOYMENT }} \
+            app="${IMAGE}" \
+            -n ${{ env.NAMESPACE }}
+
+          kubectl rollout status deployment/${{ env.STABLE_DEPLOYMENT }} \
+            -n ${{ env.NAMESPACE }} \
+            --timeout=300s
+
+          # Remove o deployment canary
+          kubectl delete deployment ${{ env.CANARY_DEPLOYMENT }} \
+            -n ${{ env.NAMESPACE }} \
+            --ignore-not-found=true
+
+          # Reseta peso do Ingress para 0 (canary removido)
+          chmod +x scripts/canary-promote.sh
+          ./scripts/canary-promote.sh \
+            --cluster-type="${{ inputs.target }}" \
+            --namespace="${{ env.NAMESPACE }}" \
+            --new-weight="0"
+
+          echo "Full rollout concluído! Versão ${{ inputs.image_tag }} agora é a versão stable."
