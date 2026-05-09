@@ -1,0 +1,186 @@
+# =============================================================================
+# .gitignore — GCP Azure DevOps Platform
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Terraform
+# -----------------------------------------------------------------------------
+# Diretório de plugins e providers (baixados localmente)
+**/.terraform/
+**/.terraform.lock.hcl
+
+# Arquivos de estado (NUNCA commitar — contêm dados sensíveis)
+*.tfstate
+*.tfstate.backup
+*.tfstate.*.backup
+
+# Arquivo de variáveis com valores reais (usar .example para template)
+terraform.tfvars
+*.auto.tfvars
+# Exceção: arquivos de exemplo não contêm dados reais
+!*.tfvars.example
+!*terraform.tfvars.example
+
+# Planos de execução (podem conter dados sensíveis)
+*.tfplan
+*.out
+tfplan-*.out
+
+# Crash logs do Terraform
+crash.log
+crash.*.log
+
+# Override files (usado para desenvolvimento local)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+.Python
+.python-version
+
+# Ambientes virtuais
+venv/
+env/
+ENV/
+.venv/
+.env/
+virtualenv/
+
+# Cobertura de testes
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# Distribuição / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Jupyter
+.ipynb_checkpoints/
+
+# pytest
+.pytest_cache/
+.tox/
+
+# -----------------------------------------------------------------------------
+# Credenciais e Secrets (NUNCA commitar)
+# -----------------------------------------------------------------------------
+# Arquivos .env com secrets
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Chaves de Service Account Google
+*service-account*.json
+*sa-key*.json
+*credentials*.json
+google-credentials.json
+gcp-key.json
+
+# Certificados e chaves privadas
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+# Exceção: certificados de CA públicos em repositórios de infraestrutura
+!ca-certificates.crt
+
+# Azure credentials
+azure-credentials.json
+azure.json
+
+# Kubeconfig com credenciais de clusters
+kubeconfig
+kubeconfig.*
+.kube/config
+
+# -----------------------------------------------------------------------------
+# Docker
+# -----------------------------------------------------------------------------
+# Contextos Docker locais
+.dockerignore.local
+
+# -----------------------------------------------------------------------------
+# IDEs e Editores
+# -----------------------------------------------------------------------------
+# VSCode
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json.example
+
+# IntelliJ
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# JetBrains
+.idea/
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+\#*\#
+.\#*
+
+# MacOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# -----------------------------------------------------------------------------
+# Logs e Temporários
+# -----------------------------------------------------------------------------
+*.log
+*.tmp
+*.temp
+/tmp/
+/logs/
+
+# Relatórios de scans de segurança (não commitar — gerados pelo CI)
+tfsec-*.sarif
+checkov-*.sarif
+trivy-*.sarif
+semgrep-*.sarif
+gitleaks.sarif
+safety-report.json
+pip-audit-report.json
+npm-audit-report.json
+
+# Infracost
+.infracost/
+
+# -----------------------------------------------------------------------------
+# Documentação gerada
+# -----------------------------------------------------------------------------
+terraform-docs.md
+# Exceção: documentação mantida manualmente
+!README.md
