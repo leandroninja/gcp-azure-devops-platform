@@ -338,3 +338,13 @@ chmod +x scripts/validate-local.sh
 ## Licença
 
 MIT — uso livre para fins educacionais e demonstração de competências técnicas.
+
+---
+
+## Autor
+
+**Leandro Oliveira Moraes**
+Arquiteto Sênior DevOps & Multi-Cloud | Segurança & FinOps
+Intel Cloud FinOps Certified | Harness Cloud Cost Management
+
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-leandro--oliveira--26b14768-blue?logo=linkedin)](https://linkedin.com/in/leandro-oliveira-26b14768)
