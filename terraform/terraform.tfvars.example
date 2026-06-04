@@ -1,0 +1,65 @@
+# =============================================================================
+# EXEMPLO DE CONFIGURAÇÃO — terraform.tfvars
+# =============================================================================
+# Copie este arquivo para terraform.tfvars e preencha com seus valores reais.
+# NUNCA comite o terraform.tfvars pois pode conter valores sensíveis.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# GCP
+# -----------------------------------------------------------------------------
+gcp_project_id = "meu-projeto-gcp-123456"
+gcp_region     = "us-central1"
+
+# (Opcional) Para execução local com impersonação de Service Account
+# gcp_impersonate_sa = "cicd-sa@meu-projeto-gcp-123456.iam.gserviceaccount.com"
+
+# -----------------------------------------------------------------------------
+# Azure
+# -----------------------------------------------------------------------------
+azure_subscription_id   = "00000000-0000-0000-0000-000000000000"
+azure_location          = "eastus"
+azure_cicd_principal_id = "00000000-0000-0000-0000-000000000000"  # Object ID do SP de CI/CD
+
+# -----------------------------------------------------------------------------
+# Configurações Compartilhadas
+# -----------------------------------------------------------------------------
+environment = "production"
+app_name    = "devops-platform"
+
+# -----------------------------------------------------------------------------
+# GitHub — Workload Identity
+# -----------------------------------------------------------------------------
+github_org  = "minha-organizacao"
+github_repo = "gcp-azure-devops-platform"
+
+# -----------------------------------------------------------------------------
+# GKE — Configuração do Cluster
+# -----------------------------------------------------------------------------
+gke_config = {
+  cluster_version      = "1.28"
+  node_machine_type    = "e2-standard-4"   # 4 vCPU, 16 GB RAM
+  node_disk_size_gb    = 100
+  node_pool_min_count  = 2                  # Mínimo 2 nodes por zona
+  node_pool_max_count  = 8                  # Máximo 8 nodes por zona
+  enable_private_nodes = true               # Nodes sem IP público
+  master_cidr          = "172.16.0.0/28"   # CIDR do control plane
+}
+
+# -----------------------------------------------------------------------------
+# AKS — Configuração do Cluster
+# -----------------------------------------------------------------------------
+aks_config = {
+  kubernetes_version    = "1.28"
+  system_node_vm_size   = "Standard_D4s_v3"   # 4 vCPU, 16 GB RAM
+  system_node_min_count = 2
+  system_node_max_count = 5
+  user_node_vm_size     = "Standard_D8s_v3"   # 8 vCPU, 32 GB RAM
+  user_node_min_count   = 1
+  user_node_max_count   = 10
+  enable_azure_policy   = true
+  enable_oms_agent      = true
+  network_policy        = "azure"
+}
