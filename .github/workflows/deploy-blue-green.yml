@@ -1,0 +1,461 @@
+name: Deploy Blue-Green
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_cluster:
+        description: "Cluster alvo para o deploy"
+        required: true
+        type: choice
+        options:
+          - gke
+          - aks
+          - both
+      image_tag:
+        description: "Tag da imagem Docker a ser deployada (ex: v1.2.0)"
+        required: true
+        type: string
+      environment:
+        description: "Ambiente de destino"
+        required: true
+        type: choice
+        options:
+          - production
+          - staging
+        default: production
+      skip_smoke_tests:
+        description: "Pular smoke tests (apenas para emergências)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-blue-green-${{ inputs.environment }}-${{ inputs.target_cluster }}
+  cancel-in-progress: false  # Nunca cancela deploys em andamento
+
+env:
+  NAMESPACE: ${{ inputs.environment }}
+  SERVICE_NAME: sample-app
+  MONITOR_DURATION: 300  # 5 minutos de monitoramento pós-switch
+  HEALTH_CHECK_RETRIES: 10
+  HEALTH_CHECK_INTERVAL: 30
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JOB: Validação e preparação do deploy
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Preparar Deploy Blue-Green
+    runs-on: ubuntu-latest
+
+    outputs:
+      active_slot:    ${{ steps.detect_slot.outputs.active_slot }}
+      inactive_slot:  ${{ steps.detect_slot.outputs.inactive_slot }}
+      deploy_id:      ${{ steps.deploy_id.outputs.id }}
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Gerar ID único para este deploy
+        id: deploy_id
+        run: |
+          DEPLOY_ID="bg-$(date +%Y%m%d-%H%M%S)-${{ github.run_id }}"
+          echo "id=${DEPLOY_ID}" >> $GITHUB_OUTPUT
+          echo "Deploy ID: ${DEPLOY_ID}"
+
+      - name: Autenticar no GCP (se target = gke ou both)
+        if: inputs.target_cluster == 'gke' || inputs.target_cluster == 'both'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configurar kubeconfig GKE
+        if: inputs.target_cluster == 'gke' || inputs.target_cluster == 'both'
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER_NAME }}
+          location:     ${{ secrets.GKE_CLUSTER_REGION }}
+
+      - name: Autenticar no Azure (se target = aks ou both)
+        if: inputs.target_cluster == 'aks' || inputs.target_cluster == 'both'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Configurar kubeconfig AKS
+        if: inputs.target_cluster == 'aks' || inputs.target_cluster == 'both'
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          cluster-name:   ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Detectar slot ativo atual
+        id: detect_slot
+        run: |
+          echo "=== Detectando slot ativo no cluster ${{ inputs.target_cluster }} ==="
+
+          # Lê o label 'slot' no Service para identificar slot ativo
+          ACTIVE=$(kubectl get service ${{ env.SERVICE_NAME }} \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.spec.selector.slot}' 2>/dev/null || echo "blue")
+
+          if [ "$ACTIVE" == "blue" ]; then
+            INACTIVE="green"
+          else
+            INACTIVE="blue"
+          fi
+
+          echo "Slot ativo atual: ${ACTIVE}"
+          echo "Slot inativo (destino): ${INACTIVE}"
+          echo "active_slot=${ACTIVE}" >> $GITHUB_OUTPUT
+          echo "inactive_slot=${INACTIVE}" >> $GITHUB_OUTPUT
+
+      - name: Resumo da preparação
+        run: |
+          echo "### Resumo do Deploy Blue-Green" >> $GITHUB_STEP_SUMMARY
+          echo "| Campo | Valor |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster | ${{ inputs.target_cluster }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ambiente | ${{ inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | ${{ inputs.image_tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Slot Ativo | ${{ steps.detect_slot.outputs.active_slot }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Slot Destino | ${{ steps.detect_slot.outputs.inactive_slot }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy ID | ${{ steps.deploy_id.outputs.id }} |" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # JOB: Deploy no slot inativo (sem afetar tráfego de produção)
+  # ---------------------------------------------------------------------------
+  deploy-inactive:
+    name: Deploy no Slot ${{ needs.prepare.outputs.inactive_slot }}
+    runs-on: ubuntu-latest
+    needs: prepare
+    environment: ${{ inputs.environment }}
+
+    env:
+      INACTIVE_SLOT: ${{ needs.prepare.outputs.inactive_slot }}
+      ACTIVE_SLOT:   ${{ needs.prepare.outputs.active_slot }}
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Autenticar no GCP
+        if: inputs.target_cluster == 'gke' || inputs.target_cluster == 'both'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configurar kubeconfig GKE
+        if: inputs.target_cluster == 'gke' || inputs.target_cluster == 'both'
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER_NAME }}
+          location:     ${{ secrets.GKE_CLUSTER_REGION }}
+
+      - name: Autenticar no Azure
+        if: inputs.target_cluster == 'aks' || inputs.target_cluster == 'both'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Configurar kubeconfig AKS
+        if: inputs.target_cluster == 'aks' || inputs.target_cluster == 'both'
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          cluster-name:   ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Atualizar imagem no Deployment do slot inativo
+        run: |
+          echo "=== Atualizando slot ${INACTIVE_SLOT} com imagem ${{ inputs.image_tag }} ==="
+
+          # Determina o registry correto por cluster
+          if [ "${{ inputs.target_cluster }}" == "gke" ]; then
+            REGISTRY="${{ secrets.GCP_ARTIFACT_REGISTRY }}"
+          else
+            REGISTRY="${{ secrets.AZURE_CONTAINER_REGISTRY }}"
+          fi
+
+          IMAGE="${REGISTRY}/${{ env.SERVICE_NAME }}:${{ inputs.image_tag }}"
+
+          # Aplica o manifesto do slot inativo com a nova imagem
+          kubectl set image deployment/${{ env.SERVICE_NAME }}-${INACTIVE_SLOT} \
+            app="${IMAGE}" \
+            -n ${{ env.NAMESPACE }}
+
+          # Adiciona anotação com informações do deploy
+          kubectl annotate deployment/${{ env.SERVICE_NAME }}-${INACTIVE_SLOT} \
+            kubernetes.io/change-cause="Deploy ${{ inputs.image_tag }} via GitHub Actions run ${{ github.run_id }}" \
+            deploy-id="${{ needs.prepare.outputs.deploy_id }}" \
+            deploy-timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -n ${{ env.NAMESPACE }} \
+            --overwrite
+
+      - name: Aguardar rollout do slot inativo
+        run: |
+          echo "=== Aguardando rollout do deployment ${INACTIVE_SLOT} ==="
+          kubectl rollout status deployment/${{ env.SERVICE_NAME }}-${INACTIVE_SLOT} \
+            -n ${{ env.NAMESPACE }} \
+            --timeout=600s
+
+      - name: Health checks no slot inativo
+        if: inputs.skip_smoke_tests != 'true'
+        run: |
+          echo "=== Executando health checks no slot ${INACTIVE_SLOT} ==="
+
+          # Faz port-forward para testar localmente sem expor ao tráfego
+          kubectl port-forward \
+            deployment/${{ env.SERVICE_NAME }}-${INACTIVE_SLOT} \
+            8080:8080 \
+            -n ${{ env.NAMESPACE }} &
+          PF_PID=$!
+
+          # Aguarda o port-forward estar pronto
+          sleep 5
+
+          # Health check com retentativas
+          RETRIES=0
+          MAX_RETRIES=${{ env.HEALTH_CHECK_RETRIES }}
+          until curl -sf http://localhost:8080/health | grep -q '"status":"ok"'; do
+            RETRIES=$((RETRIES+1))
+            if [ "$RETRIES" -ge "$MAX_RETRIES" ]; then
+              echo "ERRO: Health check falhou após ${MAX_RETRIES} tentativas"
+              kill $PF_PID 2>/dev/null
+              exit 1
+            fi
+            echo "Health check tentativa ${RETRIES}/${MAX_RETRIES}..."
+            sleep ${{ env.HEALTH_CHECK_INTERVAL }}
+          done
+
+          echo "Health check passou!"
+          VERSION=$(curl -sf http://localhost:8080/version)
+          echo "Versão deployada: ${VERSION}"
+
+          kill $PF_PID 2>/dev/null
+          echo "Slot ${INACTIVE_SLOT} saudável e pronto para receber tráfego"
+
+  # ---------------------------------------------------------------------------
+  # JOB: Switch de tráfego para o novo slot
+  # ---------------------------------------------------------------------------
+  switch-traffic:
+    name: Mudar Tráfego para ${{ needs.prepare.outputs.inactive_slot }}
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy-inactive]
+    environment: ${{ inputs.environment }}-traffic-switch
+
+    env:
+      INACTIVE_SLOT: ${{ needs.prepare.outputs.inactive_slot }}
+      ACTIVE_SLOT:   ${{ needs.prepare.outputs.active_slot }}
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Autenticar no GCP
+        if: inputs.target_cluster == 'gke' || inputs.target_cluster == 'both'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configurar kubeconfig GKE
+        if: inputs.target_cluster == 'gke' || inputs.target_cluster == 'both'
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER_NAME }}
+          location:     ${{ secrets.GKE_CLUSTER_REGION }}
+
+      - name: Autenticar no Azure
+        if: inputs.target_cluster == 'aks' || inputs.target_cluster == 'both'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Configurar kubeconfig AKS
+        if: inputs.target_cluster == 'aks' || inputs.target_cluster == 'both'
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          cluster-name:   ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Mudar selector do Service para o novo slot
+        run: |
+          echo "=== Alternando tráfego: ${ACTIVE_SLOT} → ${INACTIVE_SLOT} ==="
+          chmod +x scripts/blue-green-switch.sh
+          ./scripts/blue-green-switch.sh \
+            --cluster-type="${{ inputs.target_cluster }}" \
+            --namespace="${{ env.NAMESPACE }}" \
+            --service="${{ env.SERVICE_NAME }}" \
+            --new-slot="${INACTIVE_SLOT}"
+
+      - name: Registrar switch no log de auditoria
+        run: |
+          echo "=== AUDITORIA DE SWITCH ===" >> $GITHUB_STEP_SUMMARY
+          echo "- **De**: \`${ACTIVE_SLOT}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Para**: \`${INACTIVE_SLOT}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Imagem**: \`${{ inputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp**: \`$(date -u +%Y-%m-%dT%H:%M:%SZ)\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Autor**: \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Run ID**: \`${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # JOB: Verificação pós-switch (5 minutos de monitoramento)
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Verificar Nova Versão em Produção
+    runs-on: ubuntu-latest
+    needs: [prepare, switch-traffic]
+
+    env:
+      NEW_SLOT: ${{ needs.prepare.outputs.inactive_slot }}
+
+    steps:
+      - name: Aguardar estabilização (60 segundos)
+        run: sleep 60
+
+      - name: Autenticar no GCP
+        if: inputs.target_cluster == 'gke' || inputs.target_cluster == 'both'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configurar kubeconfig GKE
+        if: inputs.target_cluster == 'gke' || inputs.target_cluster == 'both'
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER_NAME }}
+          location:     ${{ secrets.GKE_CLUSTER_REGION }}
+
+      - name: Verificar pods do novo slot
+        run: |
+          echo "=== Status dos pods no slot ${NEW_SLOT} ==="
+          kubectl get pods \
+            -l slot=${NEW_SLOT} \
+            -n ${{ env.NAMESPACE }} \
+            -o wide
+
+          READY=$(kubectl get pods \
+            -l slot=${NEW_SLOT} \
+            -n ${{ env.NAMESPACE }} \
+            --field-selector=status.phase=Running \
+            --no-headers | wc -l)
+
+          TOTAL=$(kubectl get pods \
+            -l slot=${NEW_SLOT} \
+            -n ${{ env.NAMESPACE }} \
+            --no-headers | wc -l)
+
+          echo "Pods prontos: ${READY}/${TOTAL}"
+          [ "${READY}" -gt 0 ] || (echo "ERRO: Nenhum pod pronto!" && exit 1)
+
+      - name: Monitorar métricas por ${{ env.MONITOR_DURATION }} segundos
+        run: |
+          echo "=== Monitorando nova versão por ${{ env.MONITOR_DURATION }}s ==="
+          END=$(($(date +%s) + ${{ env.MONITOR_DURATION }}))
+          INTERVAL=30
+          CHECKS=0
+          ERRORS=0
+
+          while [ $(date +%s) -lt $END ]; do
+            CHECKS=$((CHECKS+1))
+            echo "[Check ${CHECKS}] $(date -u +%H:%M:%S) — verificando saúde..."
+
+            # Verifica pods em CrashLoopBackOff
+            CRASH=$(kubectl get pods \
+              -l slot=${NEW_SLOT} \
+              -n ${{ env.NAMESPACE }} \
+              --no-headers | grep -c "CrashLoopBackOff" || true)
+
+            if [ "$CRASH" -gt 0 ]; then
+              ERRORS=$((ERRORS+1))
+              echo "AVISO: ${CRASH} pod(s) em CrashLoopBackOff!"
+            else
+              echo "OK — todos os pods saudáveis"
+            fi
+
+            # Se mais de 2 erros consecutivos, falha o job
+            [ "$ERRORS" -lt 3 ] || (echo "ERRO: Muitas falhas detectadas! Considere rollback." && exit 1)
+
+            sleep $INTERVAL
+          done
+
+          echo "Monitoramento concluído. Checks: ${CHECKS}, Erros: ${ERRORS}"
+          echo "Deploy blue-green concluído com sucesso!"
+
+  # ---------------------------------------------------------------------------
+  # JOB: Rollback automático em caso de falha
+  # ---------------------------------------------------------------------------
+  rollback:
+    name: Rollback Automático
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy-inactive, switch-traffic, verify]
+    if: failure()
+
+    env:
+      ACTIVE_SLOT: ${{ needs.prepare.outputs.active_slot }}
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Autenticar no GCP
+        if: inputs.target_cluster == 'gke' || inputs.target_cluster == 'both'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configurar kubeconfig GKE
+        if: inputs.target_cluster == 'gke' || inputs.target_cluster == 'both'
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER_NAME }}
+          location:     ${{ secrets.GKE_CLUSTER_REGION }}
+
+      - name: Autenticar no Azure
+        if: inputs.target_cluster == 'aks' || inputs.target_cluster == 'both'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Configurar kubeconfig AKS
+        if: inputs.target_cluster == 'aks' || inputs.target_cluster == 'both'
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          cluster-name:   ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Reverter Service para slot anterior
+        run: |
+          echo "=== ROLLBACK: revertendo para slot ${ACTIVE_SLOT} ==="
+          chmod +x scripts/blue-green-switch.sh
+          ./scripts/blue-green-switch.sh \
+            --cluster-type="${{ inputs.target_cluster }}" \
+            --namespace="${{ env.NAMESPACE }}" \
+            --service="${{ env.SERVICE_NAME }}" \
+            --new-slot="${ACTIVE_SLOT}"
+
+          echo "ROLLBACK CONCLUÍDO — tráfego revertido para slot ${ACTIVE_SLOT}"
+
+      - name: Notificar equipe sobre rollback
+        run: |
+          echo "### ROLLBACK AUTOMÁTICO EXECUTADO" >> $GITHUB_STEP_SUMMARY
+          echo "**Causa**: Falha detectada durante o deploy" >> $GITHUB_STEP_SUMMARY
+          echo "**Revertido para**: slot \`${ACTIVE_SLOT}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Ação necessária**: investigar logs do run ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY

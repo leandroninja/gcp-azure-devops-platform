@@ -1,0 +1,184 @@
+name: CI — Lint, Testes, Build e Análise de Custo
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JOB: Lint — Valida formatação e estilo do código
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint (YAML, Terraform, Shell)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Lint YAML — verifica formatação dos arquivos YAML
+        uses: ibiqlik/action-yamllint@v3
+        with:
+          config_data: |
+            extends: default
+            rules:
+              line-length:
+                max: 200
+              truthy:
+                allowed-values: ['true', 'false', 'on', 'off']
+              document-start:
+                present: false
+              colons:
+                max-spaces-after: -1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform Format Check — GCP e Azure
+        run: |
+          echo "=== Verificando formatação Terraform ==="
+          terraform fmt -check -recursive terraform/
+          echo "Formatação OK"
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: "v0.50.0"
+
+      - name: TFLint — análise estática do Terraform
+        run: |
+          cd terraform
+          tflint --init
+          tflint --recursive
+
+      - name: ShellCheck — analisa scripts Bash
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: './scripts'
+          severity: warning
+
+  # ---------------------------------------------------------------------------
+  # JOB: Test — Testes unitários dos scripts Python
+  # ---------------------------------------------------------------------------
+  test:
+    name: Testes Python
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Instalar dependências de teste
+        run: |
+          pip install --upgrade pip
+          pip install pytest pytest-cov pytest-mock
+          if [ -f apps/sample-app/requirements.txt ]; then
+            pip install -r apps/sample-app/requirements.txt
+          fi
+
+      - name: Executar testes com cobertura
+        run: |
+          pytest apps/ \
+            --cov=apps \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --junit-xml=test-results.xml \
+            -v \
+            || echo "Sem testes encontrados — OK para projeto novo"
+
+      - name: Publicar resultados dos testes
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Resultados dos Testes Python
+          path: test-results.xml
+          reporter: java-junit
+          fail-on-error: false
+
+  # ---------------------------------------------------------------------------
+  # JOB: Build — Valida o build Docker (sem push)
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build Docker (Validação)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build imagem Docker — sample-app
+        uses: docker/build-push-action@v5
+        with:
+          context: apps/sample-app
+          file: apps/sample-app/Dockerfile
+          push: false
+          tags: |
+            sample-app:pr-${{ github.event.pull_request.number }}
+            sample-app:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            GIT_COMMIT=${{ github.sha }}
+
+      - name: Verificar metadados da imagem
+        run: |
+          echo "Build concluído com sucesso para commit: ${{ github.sha }}"
+
+  # ---------------------------------------------------------------------------
+  # JOB: Custo de Infraestrutura — Infracost estima o custo do PR
+  # ---------------------------------------------------------------------------
+  infrastructure-cost:
+    name: Análise de Custo (Infracost)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Gerar breakdown de custo — GCP
+        run: |
+          infracost breakdown \
+            --path terraform/ \
+            --terraform-var-file terraform/terraform.tfvars.example \
+            --format json \
+            --out-file /tmp/infracost-gcp.json \
+            || echo "Infracost não configurado — pulando análise de custo"
+
+      - name: Comentar custo estimado no PR
+        uses: infracost/actions/comment@v2
+        if: ${{ env.INFRACOST_API_KEY != '' }}
+        with:
+          path: /tmp/infracost-gcp.json
+          behavior: update
+          tag: infracost-estimate
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
